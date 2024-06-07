@@ -1,417 +1,431 @@
-name: Installers
-
-on:
-  push:
-    branches:
-      - master
-  pull_request:
-    branches:
-      - master
-
-env:
-  # Java version to use in the Jitsi Desktop jars
-  INSTALLER_JAVA_VERSION: 17
-
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-
+  group: ${{ github.workflow }}-${{ github.ref }}
+env:
+  INSTALLER_JAVA_VERSION: 17
 jobs:
-  version:
-    name: Versioning
-    runs-on: ubuntu-latest
-    outputs:
-      jitsi_version_major: ${{ steps.parse.outputs.jitsi_version_major }}
-      jitsi_version_minor: ${{ steps.parse.outputs.jitsi_version_minor }}
-      jitsi_version_suffix: ${{ steps.parse.outputs.jitsi_version_suffix }}
-      jitsi_version_git: ${{ steps.parse.outputs.jitsi_version_git }}
-      jitsi_version_ncommits: ${{ steps.parse.outputs.jitsi_version_ncommits }}
-      jitsi_version_hash: ${{ steps.parse.outputs.jitsi_version_hash }}
-      jitsi_version_short: ${{ steps.parse.outputs.jitsi_version_short }}
-      jitsi_version_full: ${{ steps.parse.outputs.jitsi_version_full }}
-      jitsi_version_deb: ${{ steps.parse.outputs.jitsi_version_deb }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
-
-      - name: Set up Java
-        uses: actions/setup-java@v3
-        with:
-          java-version: ${{ env.INSTALLER_JAVA_VERSION }}
-          distribution: temurin
-
-      # don't use the setup-java cache option as this only caches what is
-      # necessary for the version, not the other jobs
-      - name: Cache local Maven repository
-        uses: actions/cache@v3
-        with:
-          path: ~/.m2/repository
-          key: ${{ runner.os }}-maven-version-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-maven-version-
-
-      - name: Parse version
-        id: parse
-        run: resources/version.sh
-
-  javah:
-    name: Compile Java for native headers
-    runs-on: ubuntu-latest
-    needs:
-      - version
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-
-      - name: Set up Java
-        uses: actions/setup-java@v3
-        with:
-          java-version: ${{ env.INSTALLER_JAVA_VERSION }}
-          distribution: temurin
-          cache: maven
-
-      - name: Compile
-        run: mvn -B compile
-
-      - name: Upload JNI headers
-        uses: actions/upload-artifact@v3
-        with:
-          name: javah
-          path: target/native
-
   deb:
-    name: ${{ matrix.dist.vendor }} ${{ matrix.dist.dist }} ${{ matrix.arch }}
-    runs-on: ubuntu-latest
-    needs:
-      - version
-      - javah
-    strategy:
-      fail-fast: false
-      matrix:
-        dist:
-          - { vendor: ubuntu, dist: focal }
-          - { vendor: ubuntu, dist: jammy }
-          - { vendor: ubuntu, dist: mantic }
-          - { vendor: debian, dist: bullseye }
-          - { vendor: debian, dist: bookworm }
-        arch:
-          - amd64
-          - arm64
-          - ppc64el
-        include: [
-          { dist: { vendor: debian, dist: bullseye }, arch: i386 },
-          { dist: { vendor: debian, dist: bookworm }, arch: i386 },
-        ]
-
     env:
-      UBUNTUTOOLS_UBUNTU_MIRROR: http://azure.archive.ubuntu.com/ubuntu
+      DEBIAN_FRONTEND: noninteractive
       UBUNTUTOOLS_DEBIAN_MIRROR: http://ftp.debian.org/debian/
       UBUNTUTOOLS_DEBSEC_MIRROR: http://security.debian.org/debian-security/
-      DEBIAN_FRONTEND: noninteractive
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-        with:
-          #for gbp dch
-          fetch-depth: 0
-
-      - name: Get JNI headers
-        uses: actions/download-artifact@v3
-        with:
-          name: javah
-          path: target/native
-
-      - name: Set up Java
-        uses: actions/setup-java@v3
-        with:
-          java-version: ${{ env.INSTALLER_JAVA_VERSION }}
-          distribution: temurin
-          cache: maven
-
-      - name: Install tools
-        run: |
-          resources/deb-prepare.sh
-          sudo ln -s ~/.m2/repository /var/cache/m2-sbuild
-
-      - name: Import GPG key
-        env:
-          GPG_PASSPHRASE: "${{ secrets.GPG_PW }}"
-        run: |
-          cat <(echo -e "${{ secrets.GPG_KEY }}") | gpg --batch --import
-          gpg --list-secret-keys --keyid-format LONG
-
-      - name: Cache sbuild chroot stanza
-        uses: actions/cache@v3
-        id: chroot_cache
-        with:
-          path: target/chroot
-          key: chroot-${{ matrix.dist.dist }}-${{ matrix.arch }}-${{ hashFiles('target/chroot/**') }}
-          restore-keys: |
-            chroot-${{ matrix.dist.dist }}-${{ matrix.arch }}-
-
-      - name: Move chroot from cache
-        if: steps.chroot_cache.outputs.cache-hit
-        run: |
-          sudo mkdir -p /var/lib/schroot/tarballs/
-          sudo mkdir -p /etc/schroot/chroot.d/
-          sudo mv target/chroot/tarballs/* /var/lib/schroot/tarballs/
-          sudo mv target/chroot/chroot.d/* /etc/schroot/chroot.d/
-          sudo chown -R root:root /var/lib/schroot/tarballs/
-          sudo chown -R root:root /etc/schroot/chroot.d/
-
-      - name: Build deb package
-        # the user executing sbuild needs to be in the group sbuild, a relogin is not possible here
-        # bionic doesn't have /bin and /usr/bin merged, thus /bin/bash
-        shell: /usr/bin/sg sbuild -c "/bin/bash -e {0}"
-        env:
-          GPG_PASSPHRASE: "${{ secrets.GPG_PW }}"
-        run: |
-          resources/deb-build.sh \
-            "${{ needs.version.outputs.jitsi_version_deb }}" \
-            "${{ matrix.dist.dist }}" \
-            "${{ matrix.arch }}" \
-            "dev+maven@jitsi.org"
-
-      - name: make build files readable for Windows and archivable for GitHub Actions
-        if: ${{ always() }}
-        run: rename 's|:|-|g' target/debian/${{ matrix.dist.dist }}/*.build
-
-      - name: Upload packages and/or build logs as artifact
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v3
-        with:
-          name: ${{ matrix.dist.vendor }}-${{ matrix.dist.dist }}-${{ matrix.arch }}
-          path: target/debian/${{ matrix.dist.dist }}/*
-
-      - name: Archive chroot for cache
-        run: |
-          mkdir -p target/chroot
-          sudo mv /var/lib/schroot/tarballs/ target/chroot
-          sudo mv /etc/schroot/chroot.d/ target/chroot
-          sudo chown -R runner:runner target/chroot
-
-  wix:
-    name: Windows ${{ matrix.arch.actions }}
-    runs-on: windows-latest
-    needs: version
-    strategy:
-      matrix:
-        arch:
-          #- { actions: x86, cmake: Win32, cmake_opposite_arch: x64, java: "x86" }
-          - { actions: x64, cmake: x64, cmake_opposite_arch: Win32, java: "x86-64" }
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-
-      - name: Private SDK Download
-        uses: actions/checkout@v3
-        with:
-          repository: jitsi/jitsi-3rdparty-nonredist
-          ssh-key: ${{ secrets.PRIVATE_SDK_KEY }}
-          path: build/private-sdk
-
-      - name: Set up Java
-        id: install_java
-        uses: actions/setup-java@v3
-        with:
-          distribution: temurin
-          java-version: ${{ env.INSTALLER_JAVA_VERSION }}
-          architecture: ${{ matrix.arch.actions }}
-          cache: maven
-
-      - name: Build Java
-        shell: cmd
-        run: mvn -B -DskipTests -Drevision=${{ needs.version.outputs.jitsi_version_full }} package
-
-      - name: Cache Gradle dependencies
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*') }}
-          restore-keys: |
-            ${{ runner.os }}-gradle-
-
-      - name: Verify Gradle Wrapper
-        uses: gradle/wrapper-validation-action@v1
-
-      - name: Build natives
-        env:
-          JAVA_HOME: ${{ steps.install_java.outputs.path }}
-        shell: cmd
-        run: |
-          cd %GITHUB_WORKSPACE%\native
-          cmake -B cmake-build-${{ matrix.arch.actions }} -A ${{ matrix.arch.cmake }} ^
-            -DMAIN_VERSION=${{ needs.version.outputs.jitsi_version_full }} ^
-            -DGIT_VERSION=${{ needs.version.outputs.jitsi_version_git }} ^
-            -DOCSDK_DIR=%GITHUB_WORKSPACE%\build\private-sdk\ocsdk2007 ^
-            -DMAPI_HEADERS_DIR=%GITHUB_WORKSPACE%\build\private-sdk\outlook2010mapi
-          cmake --build cmake-build-${{ matrix.arch.actions }} --config Release --target install
-
-      - name: Build Outlook COM Server natives for opposite arch (${{ matrix.arch.cmake_opposite_arch }})
-        env:
-          JAVA_HOME: ${{ steps.install_java.outputs.path }}
-        shell: cmd
-        run: |
-          cd %GITHUB_WORKSPACE%\native
-          cmake -B cmake-build-${{ matrix.arch.cmake_opposite_arch }} -A ${{ matrix.arch.cmake_opposite_arch }} ^
-            -DMAIN_VERSION=${{ needs.version.outputs.jitsi_version_full }} ^
-            -DGIT_VERSION=${{ needs.version.outputs.jitsi_version_git }} ^
-            -DOCSDK_DIR=%GITHUB_WORKSPACE%\build\private-sdk\ocsdk2007 ^
-            -DMAPI_HEADERS_DIR=%GITHUB_WORKSPACE%\build\private-sdk\outlook2010mapi
-          cmake --build cmake-build-${{ matrix.arch.cmake_opposite_arch }} --config Release --target install.jmsoutlookaddrbookcomserver
-          cd %GITHUB_WORKSPACE%
-          copy lib\native\win32-x86-64\jmsoutlookaddrbookcomserver64.exe lib\native\win32-x86\jmsoutlookaddrbookcomserver64.exe
-          copy lib\native\win32-x86\jmsoutlookaddrbookcomserver32.exe lib\native\win32-x86-64\jmsoutlookaddrbookcomserver32.exe
-
-      - name: Upload CMake logs on failure
-        if: ${{ failure() }}
-        run: Compress-Archive -Path $Env:GITHUB_WORKSPACE/native/windows/src/native/cmake-build-${{ matrix.arch.actions }} -DestinationPath $Env:GITHUB_WORKSPACE/debug-logs.zip
-
-      - name: Upload Debug logs
-        if: ${{ failure() }}
-        uses: actions/upload-artifact@v3
-        with:
-          name: win-${{ matrix.arch.actions }}-debug
-          path: debug*
-
-      - name: Set up Java
-        id: install_java_x64
-        uses: actions/setup-java@v3
-        with:
-          java-version: ${{ env.INSTALLER_JAVA_VERSION }}
-          architecture: x64
-          distribution: temurin
-
-      - name: Build installer
-        env:
-          JAVA_HOME: ${{ steps.install_java_x64.outputs.path }}
-        shell: bash
-        run: |
-          cd $GITHUB_WORKSPACE/resources/install
-          ./gradlew --no-daemon --stacktrace windowsZip signMsi -Papplication.target=${{ matrix.arch.java }} -Pversion=${{ needs.version.outputs.jitsi_version_full }} -PgitVersion=${{ needs.version.outputs.jitsi_version_git }}
-
-      - name: Upload msi
-        uses: actions/upload-artifact@v3
-        with:
-          name: jitsi-win-${{ matrix.arch.actions }}
-          path: |
-            resources/install/build/install/wix/jitsi-*.msi
-            resources/install/build/distributions/jitsi-*.zip
-
-  mac:
-    runs-on: macos-latest
+      UBUNTUTOOLS_UBUNTU_MIRROR: http://azure.archive.ubuntu.com/ubuntu
+    name: ${{ matrix.dist.vendor }} ${{ matrix.dist.dist }} ${{ matrix.arch }}
     needs:
-      - version
-      - javah
+    - version
+    - javah
+    runs-on: self-hosted
+    steps:
+    - continue-on-error: true
+      name: Checkout
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+    - continue-on-error: true
+      name: Get JNI headers
+      uses: actions/download-artifact@v3
+      with:
+        name: javah
+        path: target/native
+    - continue-on-error: true
+      name: Set up Java
+      uses: actions/setup-java@v3
+      with:
+        cache: maven
+        distribution: temurin
+        java-version: ${{ env.INSTALLER_JAVA_VERSION }}
+    - continue-on-error: true
+      name: Install tools
+      run: 'resources/deb-prepare.sh
+
+        sudo ln -s ~/.m2/repository /var/cache/m2-sbuild
+
+        '
+    - continue-on-error: true
+      env:
+        GPG_PASSPHRASE: ${{ secrets.GPG_PW }}
+      name: Import GPG key
+      run: 'cat <(echo -e "${{ secrets.GPG_KEY }}") | gpg --batch --import
+
+        gpg --list-secret-keys --keyid-format LONG
+
+        '
+    - continue-on-error: true
+      id: chroot_cache
+      name: Cache sbuild chroot stanza
+      uses: actions/cache@v3
+      with:
+        key: chroot-${{ matrix.dist.dist }}-${{ matrix.arch }}-${{ hashFiles('target/chroot/**')
+          }}
+        path: target/chroot
+        restore-keys: 'chroot-${{ matrix.dist.dist }}-${{ matrix.arch }}-
+
+          '
+    - continue-on-error: true
+      if: steps.chroot_cache.outputs.cache-hit
+      name: Move chroot from cache
+      run: 'sudo mkdir -p /var/lib/schroot/tarballs/
+
+        sudo mkdir -p /etc/schroot/chroot.d/
+
+        sudo mv target/chroot/tarballs/* /var/lib/schroot/tarballs/
+
+        sudo mv target/chroot/chroot.d/* /etc/schroot/chroot.d/
+
+        sudo chown -R root:root /var/lib/schroot/tarballs/
+
+        sudo chown -R root:root /etc/schroot/chroot.d/
+
+        '
+    - continue-on-error: true
+      env:
+        GPG_PASSPHRASE: ${{ secrets.GPG_PW }}
+      name: Build deb package
+      run: "resources/deb-build.sh \\\n  \"${{ needs.version.outputs.jitsi_version_deb\
+        \ }}\" \\\n  \"${{ matrix.dist.dist }}\" \\\n  \"${{ matrix.arch }}\" \\\n\
+        \  \"dev+maven@jitsi.org\"\n"
+      shell: /usr/bin/sg sbuild -c "/bin/bash -e {0}"
+    - continue-on-error: true
+      if: ${{ always() }}
+      name: make build files readable for Windows and archivable for GitHub Actions
+      run: rename 's|:|-|g' target/debian/${{ matrix.dist.dist }}/*.build
+    - continue-on-error: true
+      if: ${{ always() }}
+      name: Upload packages and/or build logs as artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: ${{ matrix.dist.vendor }}-${{ matrix.dist.dist }}-${{ matrix.arch }}
+        path: target/debian/${{ matrix.dist.dist }}/*
+    - continue-on-error: true
+      name: Archive chroot for cache
+      run: 'mkdir -p target/chroot
+
+        sudo mv /var/lib/schroot/tarballs/ target/chroot
+
+        sudo mv /etc/schroot/chroot.d/ target/chroot
+
+        sudo chown -R runner:runner target/chroot
+
+        '
     strategy:
       fail-fast: false
       matrix:
         arch:
-          - x64
-          #- aarch64
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-
-      - name: Get JNI headers
-        uses: actions/download-artifact@v3
-        with:
-          name: javah
-          path: target/native
-
-      - name: Set up Java (${{ matrix.arch }})
-        id: install_java
-        uses: actions/setup-java@v3
-        with:
-          java-version: ${{ env.INSTALLER_JAVA_VERSION }}
-          distribution: temurin
-          architecture: ${{ matrix.arch }}
-
-      - name: Build natives
-        run: resources/mac-cmake.sh ${{ steps.install_java.outputs.path }} ${{ matrix.arch }}
-
-      - name: Set up Java (Host)
-        uses: actions/setup-java@v3
-        with:
-          java-version: ${{ env.INSTALLER_JAVA_VERSION }}
-          distribution: temurin
-          cache: maven
-
-      - name: Package Java
-        run: mvn -B -DskipTests -Drevision=${{ needs.version.outputs.jitsi_version_full }} package
-
-      - name: Cache Gradle dependencies
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*') }}
-          restore-keys: |
-            ${{ runner.os }}-gradle-
-
-      - name: Verify Gradle Wrapper
-        uses: gradle/wrapper-validation-action@v1
-
-      - name: Generate dmg
-        run: |
-          cd $GITHUB_WORKSPACE/resources/install
-          ./gradlew --no-daemon createDmg -Pversion=${{ needs.version.outputs.jitsi_version_full }} -PgitVersion=${{ needs.version.outputs.jitsi_version_git }}
-
-      - name: Upload dmg
-        uses: actions/upload-artifact@v3
-        with:
-          name: jitsi-mac-${{ matrix.arch }}
-          path: resources/install/build/install/jitsi-*-mac-*.dmg
-
-  release:
-    #if: github.ref == 'refs/heads/master'
+        - amd64
+        - arm64
+        - ppc64el
+        dist:
+        - dist: focal
+          vendor: ubuntu
+        - dist: jammy
+          vendor: ubuntu
+        - dist: mantic
+          vendor: ubuntu
+        - dist: bullseye
+          vendor: debian
+        - dist: bookworm
+          vendor: debian
+        include:
+        - arch: i386
+          dist:
+            dist: bullseye
+            vendor: debian
+        - arch: i386
+          dist:
+            dist: bookworm
+            vendor: debian
+  javah:
+    name: Compile Java for native headers
     needs:
-      - version
-      - deb
-      - wix
-      - mac
-    runs-on: ubuntu-latest
+    - version
+    runs-on: self-hosted
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
+    - continue-on-error: true
+      name: Checkout
+      uses: actions/checkout@v3
+    - continue-on-error: true
+      name: Set up Java
+      uses: actions/setup-java@v3
+      with:
+        cache: maven
+        distribution: temurin
+        java-version: ${{ env.INSTALLER_JAVA_VERSION }}
+    - continue-on-error: true
+      name: Compile
+      run: mvn -B compile
+    - continue-on-error: true
+      name: Upload JNI headers
+      uses: actions/upload-artifact@v3
+      with:
+        name: javah
+        path: target/native
+  mac:
+    needs:
+    - version
+    - javah
+    runs-on: self-hosted
+    steps:
+    - continue-on-error: true
+      name: Checkout
+      uses: actions/checkout@v3
+    - continue-on-error: true
+      name: Get JNI headers
+      uses: actions/download-artifact@v3
+      with:
+        name: javah
+        path: target/native
+    - continue-on-error: true
+      id: install_java
+      name: Set up Java (${{ matrix.arch }})
+      uses: actions/setup-java@v3
+      with:
+        architecture: ${{ matrix.arch }}
+        distribution: temurin
+        java-version: ${{ env.INSTALLER_JAVA_VERSION }}
+    - continue-on-error: true
+      name: Build natives
+      run: resources/mac-cmake.sh ${{ steps.install_java.outputs.path }} ${{ matrix.arch
+        }}
+    - continue-on-error: true
+      name: Set up Java (Host)
+      uses: actions/setup-java@v3
+      with:
+        cache: maven
+        distribution: temurin
+        java-version: ${{ env.INSTALLER_JAVA_VERSION }}
+    - continue-on-error: true
+      name: Package Java
+      run: mvn -B -DskipTests -Drevision=${{ needs.version.outputs.jitsi_version_full
+        }} package
+    - continue-on-error: true
+      name: Cache Gradle dependencies
+      uses: actions/cache@v3
+      with:
+        key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*') }}
+        path: '~/.gradle/caches
 
-      - name: Download binaries
-        uses: actions/download-artifact@v3
-        with:
-          path: target
+          ~/.gradle/wrapper
 
-      - name: Pack all debs to avoid GitHub filename mangling
-        run: |
-          tar -cvf debian-releases.tar target/{debian-*,ubuntu-*}/*
+          '
+        restore-keys: '${{ runner.os }}-gradle-
 
-      - name: Create release
-        uses: ncipollo/release-action@a2e71bdd4e7dab70ca26a852f29600c98b33153e
-        with:
-          artifacts: "target/**/*.msi,target/**/jitsi-*-win-*.zip,target/**/*.dmg,debian-releases.tar"
-          allowUpdates: true
-          prerelease: true
-          draft: true
-          tag: r${{ needs.version.outputs.jitsi_version_short }}
-          omitBody: true
-          removeArtifacts: true
-          replacesArtifacts: true
-          token: ${{ secrets.GITHUB_TOKEN }}
-          artifactErrorsFailBuild: true
+          '
+    - continue-on-error: true
+      name: Verify Gradle Wrapper
+      uses: gradle/wrapper-validation-action@v1
+    - continue-on-error: true
+      name: Generate dmg
+      run: 'cd $GITHUB_WORKSPACE/resources/install
 
-  #deploy:
-  #  name: Deploy Debian packages
-  #  if: github.ref == 'refs/heads/master'
-  #  needs:
-  #    - version
-  #    - release
-  #  uses: ./.github/workflows/deploy-debian.yml
-  #  with:
-  #    release_type: unstable
-  #    tag: r${{ needs.version.outputs.jitsi_version_short }}
-  #  secrets: inherit
+        ./gradlew --no-daemon createDmg -Pversion=${{ needs.version.outputs.jitsi_version_full
+        }} -PgitVersion=${{ needs.version.outputs.jitsi_version_git }}
+
+        '
+    - continue-on-error: true
+      name: Upload dmg
+      uses: actions/upload-artifact@v3
+      with:
+        name: jitsi-mac-${{ matrix.arch }}
+        path: resources/install/build/install/jitsi-*-mac-*.dmg
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+        - x64
+  release:
+    needs:
+    - version
+    - deb
+    - wix
+    - mac
+    runs-on: self-hosted
+    steps:
+    - continue-on-error: true
+      name: Checkout
+      uses: actions/checkout@v3
+    - continue-on-error: true
+      name: Download binaries
+      uses: actions/download-artifact@v3
+      with:
+        path: target
+    - continue-on-error: true
+      name: Pack all debs to avoid GitHub filename mangling
+      run: 'tar -cvf debian-releases.tar target/{debian-*,ubuntu-*}/*
+
+        '
+    - continue-on-error: true
+      name: Create release
+      uses: ncipollo/release-action@a2e71bdd4e7dab70ca26a852f29600c98b33153e
+      with:
+        allowUpdates: true
+        artifactErrorsFailBuild: true
+        artifacts: target/**/*.msi,target/**/jitsi-*-win-*.zip,target/**/*.dmg,debian-releases.tar
+        draft: true
+        omitBody: true
+        prerelease: true
+        removeArtifacts: true
+        replacesArtifacts: true
+        tag: r${{ needs.version.outputs.jitsi_version_short }}
+        token: ${{ secrets.GITHUB_TOKEN }}
+  version:
+    name: Versioning
+    outputs:
+      jitsi_version_deb: ${{ steps.parse.outputs.jitsi_version_deb }}
+      jitsi_version_full: ${{ steps.parse.outputs.jitsi_version_full }}
+      jitsi_version_git: ${{ steps.parse.outputs.jitsi_version_git }}
+      jitsi_version_hash: ${{ steps.parse.outputs.jitsi_version_hash }}
+      jitsi_version_major: ${{ steps.parse.outputs.jitsi_version_major }}
+      jitsi_version_minor: ${{ steps.parse.outputs.jitsi_version_minor }}
+      jitsi_version_ncommits: ${{ steps.parse.outputs.jitsi_version_ncommits }}
+      jitsi_version_short: ${{ steps.parse.outputs.jitsi_version_short }}
+      jitsi_version_suffix: ${{ steps.parse.outputs.jitsi_version_suffix }}
+    runs-on: self-hosted
+    steps:
+    - continue-on-error: true
+      name: Checkout
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+    - continue-on-error: true
+      name: Set up Java
+      uses: actions/setup-java@v3
+      with:
+        distribution: temurin
+        java-version: ${{ env.INSTALLER_JAVA_VERSION }}
+    - continue-on-error: true
+      name: Cache local Maven repository
+      uses: actions/cache@v3
+      with:
+        key: ${{ runner.os }}-maven-version-${{ hashFiles('**/pom.xml') }}
+        path: ~/.m2/repository
+        restore-keys: '${{ runner.os }}-maven-version-
+
+          '
+    - continue-on-error: true
+      id: parse
+      name: Parse version
+      run: resources/version.sh
+  wix:
+    name: Windows ${{ matrix.arch.actions }}
+    needs: version
+    runs-on: self-hosted
+    steps:
+    - continue-on-error: true
+      name: Checkout
+      uses: actions/checkout@v3
+    - continue-on-error: true
+      name: Private SDK Download
+      uses: actions/checkout@v3
+      with:
+        path: build/private-sdk
+        repository: jitsi/jitsi-3rdparty-nonredist
+        ssh-key: ${{ secrets.PRIVATE_SDK_KEY }}
+    - continue-on-error: true
+      id: install_java
+      name: Set up Java
+      uses: actions/setup-java@v3
+      with:
+        architecture: ${{ matrix.arch.actions }}
+        cache: maven
+        distribution: temurin
+        java-version: ${{ env.INSTALLER_JAVA_VERSION }}
+    - continue-on-error: true
+      name: Build Java
+      run: mvn -B -DskipTests -Drevision=${{ needs.version.outputs.jitsi_version_full
+        }} package
+      shell: cmd
+    - continue-on-error: true
+      name: Cache Gradle dependencies
+      uses: actions/cache@v3
+      with:
+        key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*') }}
+        path: '~/.gradle/caches
+
+          ~/.gradle/wrapper
+
+          '
+        restore-keys: '${{ runner.os }}-gradle-
+
+          '
+    - continue-on-error: true
+      name: Verify Gradle Wrapper
+      uses: gradle/wrapper-validation-action@v1
+    - continue-on-error: true
+      env:
+        JAVA_HOME: ${{ steps.install_java.outputs.path }}
+      name: Build natives
+      run: "cd %GITHUB_WORKSPACE%\\native\ncmake -B cmake-build-${{ matrix.arch.actions\
+        \ }} -A ${{ matrix.arch.cmake }} ^\n  -DMAIN_VERSION=${{ needs.version.outputs.jitsi_version_full\
+        \ }} ^\n  -DGIT_VERSION=${{ needs.version.outputs.jitsi_version_git }} ^\n\
+        \  -DOCSDK_DIR=%GITHUB_WORKSPACE%\\build\\private-sdk\\ocsdk2007 ^\n  -DMAPI_HEADERS_DIR=%GITHUB_WORKSPACE%\\\
+        build\\private-sdk\\outlook2010mapi\ncmake --build cmake-build-${{ matrix.arch.actions\
+        \ }} --config Release --target install\n"
+      shell: cmd
+    - continue-on-error: true
+      env:
+        JAVA_HOME: ${{ steps.install_java.outputs.path }}
+      name: Build Outlook COM Server natives for opposite arch (${{ matrix.arch.cmake_opposite_arch
+        }})
+      run: "cd %GITHUB_WORKSPACE%\\native\ncmake -B cmake-build-${{ matrix.arch.cmake_opposite_arch\
+        \ }} -A ${{ matrix.arch.cmake_opposite_arch }} ^\n  -DMAIN_VERSION=${{ needs.version.outputs.jitsi_version_full\
+        \ }} ^\n  -DGIT_VERSION=${{ needs.version.outputs.jitsi_version_git }} ^\n\
+        \  -DOCSDK_DIR=%GITHUB_WORKSPACE%\\build\\private-sdk\\ocsdk2007 ^\n  -DMAPI_HEADERS_DIR=%GITHUB_WORKSPACE%\\\
+        build\\private-sdk\\outlook2010mapi\ncmake --build cmake-build-${{ matrix.arch.cmake_opposite_arch\
+        \ }} --config Release --target install.jmsoutlookaddrbookcomserver\ncd %GITHUB_WORKSPACE%\n\
+        copy lib\\native\\win32-x86-64\\jmsoutlookaddrbookcomserver64.exe lib\\native\\\
+        win32-x86\\jmsoutlookaddrbookcomserver64.exe\ncopy lib\\native\\win32-x86\\\
+        jmsoutlookaddrbookcomserver32.exe lib\\native\\win32-x86-64\\jmsoutlookaddrbookcomserver32.exe\n"
+      shell: cmd
+    - continue-on-error: true
+      if: ${{ failure() }}
+      name: Upload CMake logs on failure
+      run: Compress-Archive -Path $Env:GITHUB_WORKSPACE/native/windows/src/native/cmake-build-${{
+        matrix.arch.actions }} -DestinationPath $Env:GITHUB_WORKSPACE/debug-logs.zip
+    - continue-on-error: true
+      if: ${{ failure() }}
+      name: Upload Debug logs
+      uses: actions/upload-artifact@v3
+      with:
+        name: win-${{ matrix.arch.actions }}-debug
+        path: debug*
+    - continue-on-error: true
+      id: install_java_x64
+      name: Set up Java
+      uses: actions/setup-java@v3
+      with:
+        architecture: x64
+        distribution: temurin
+        java-version: ${{ env.INSTALLER_JAVA_VERSION }}
+    - continue-on-error: true
+      env:
+        JAVA_HOME: ${{ steps.install_java_x64.outputs.path }}
+      name: Build installer
+      run: 'cd $GITHUB_WORKSPACE/resources/install
+
+        ./gradlew --no-daemon --stacktrace windowsZip signMsi -Papplication.target=${{
+        matrix.arch.java }} -Pversion=${{ needs.version.outputs.jitsi_version_full
+        }} -PgitVersion=${{ needs.version.outputs.jitsi_version_git }}
+
+        '
+      shell: bash
+    - continue-on-error: true
+      name: Upload msi
+      uses: actions/upload-artifact@v3
+      with:
+        name: jitsi-win-${{ matrix.arch.actions }}
+        path: 'resources/install/build/install/wix/jitsi-*.msi
+
+          resources/install/build/distributions/jitsi-*.zip
+
+          '
+    strategy:
+      matrix:
+        arch:
+        - actions: x64
+          cmake: x64
+          cmake_opposite_arch: Win32
+          java: x86-64
+name: Installers
+on:
+  repository_dispatch:
+    types: trigger-ga___installers.yml

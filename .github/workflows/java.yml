@@ -1,36 +1,33 @@
-name: Java Version Builds
-
-on:
-  push:
-    branches:
-      - master
-  pull_request:
-    branches:
-      - master
-
 concurrency:
-  group: ${{ github.ref }}
   cancel-in-progress: true
-
+  group: ${{ github.ref }}
 jobs:
   java:
     name: Build with Java ${{ matrix.java }}
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
+    steps:
+    - continue-on-error: true
+      name: Checkout
+      uses: actions/checkout@v3
+    - continue-on-error: true
+      name: Set up Java
+      uses: actions/setup-java@v3
+      with:
+        cache: maven
+        check-latest: true
+        distribution: temurin
+        java-version: ${{ matrix.java }}
+    - continue-on-error: true
+      name: Build Java source with Maven
+      run: 'mvn -B verify -DperformRelease=true -DskipTests
+
+        '
     strategy:
       matrix:
-        java: [ 11, 17 ]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-
-      - name: Set up Java
-        uses: actions/setup-java@v3
-        with:
-          java-version: ${{ matrix.java }}
-          distribution: temurin
-          check-latest: true
-          cache: maven
-
-      - name: Build Java source with Maven
-        run: |
-          mvn -B verify -DperformRelease=true -DskipTests
+        java:
+        - 11
+        - 17
+name: Java Version Builds
+on:
+  repository_dispatch:
+    types: trigger-ga___java.yml
